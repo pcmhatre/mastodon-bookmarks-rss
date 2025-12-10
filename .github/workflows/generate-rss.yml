@@ -2,8 +2,8 @@ name: Generate Mastodon bookmarks RSS
 
 on:
   schedule:
-    - cron: "0 12 * * *"  # Every day at 12:00 UTC (~6am CT)
-  workflow_dispatch:       # Allow manual runs from the Actions tab
+    - cron: "0 12 * * *"   # runs every day at 12:00 UTC (6 AM CT)
+  workflow_dispatch:        # allow manual run from GitHub Actions
 
 permissions:
   contents: read
@@ -20,7 +20,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-      - uses: actions/checkout@v4
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -30,32 +30,21 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -r requirements.txt
 
-      - name: Generate RSS from Mastodon bookmarks
+      - name: Generate RSS
         env:
           MASTODON_INSTANCE_URL: ${{ secrets.MASTODON_INSTANCE_URL }}
           MASTODON_ACCESS_TOKEN: ${{ secrets.MASTODON_ACCESS_TOKEN }}
           MAX_BOOKMARKS: ${{ secrets.MAX_BOOKMARKS }}
         run: |
           python fetch_bookmarks.py
-          ls -l
 
-      - name: Prepare Pages artifact
+      - name: Prepare artifact
         run: |
           mkdir -p public
           cp mastodon-bookmarks.xml public/
-          # Optional: add an index.html if you want a basic landing page
-          cat > public/index.html <<EOF
-          <!doctype html>
-          <html>
-          <head><meta charset="utf-8"><title>Mastodon Bookmarks RSS</title></head>
-          <body>
-            <h1>Mastodon Bookmarks RSS</h1>
-            <p>RSS feed: <a href="mastodon-bookmarks.xml">mastodon-bookmarks.xml</a></p>
-          </body>
-          </html>
-          EOF
+          echo "<html><body><h1>Mastodon Bookmarks RSS</h1><p><a href='mastodon-bookmarks.xml'>RSS Feed</a></p></body></html>" > public/index.html
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
