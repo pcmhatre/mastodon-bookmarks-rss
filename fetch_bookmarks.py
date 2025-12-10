@@ -139,6 +139,8 @@ def fetch_bookmarks(instance: str, max_items: int):
 def build_rss(instance: str, statuses: list[dict]) -> str:
     """
     Build an RSS 2.0 feed from a list of Mastodon status objects.
+    Note: we intentionally omit the XML declaration to avoid parser issues with
+    “XML declaration allowed only at the start of the document”.
     """
     now = datetime.now(timezone.utc)
     items = []
@@ -183,9 +185,8 @@ def build_rss(instance: str, statuses: list[dict]) -> str:
 
     rss_items = "\n".join(items)
 
-    # IMPORTANT: XML declaration must be the FIRST characters in the file – no leading newline.
+    # Start directly with <rss>, no XML declaration
     rss = (
-        f'<?xml version="1.0" encoding="UTF-8"?>\n'
         f'<rss version="2.0">\n'
         f'<channel>\n'
         f'  <title>Mastodon Bookmarks RSS</title>\n'
