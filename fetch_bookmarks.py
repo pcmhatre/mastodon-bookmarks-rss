@@ -3,13 +3,13 @@ import os
 import sys
 import textwrap
 from datetime import datetime, timezone
-from urllib.parse import urlparse, parse_qs
 
 import requests
 
+# Read configuration from environment variables (set via GitHub Secrets)
 INSTANCE_URL = os.environ.get("MASTODON_INSTANCE_URL", "").rstrip("/")
 ACCESS_TOKEN = os.environ.get("MASTODON_ACCESS_TOKEN", "")
-MAX_BOOKMARKS = int(os.environ.get("MAX_BOOKMARKS", "80"))  # hard cap
+MAX_BOOKMARKS = int(os.environ.get("MAX_BOOKMARKS", "80"))
 
 if not INSTANCE_URL or not ACCESS_TOKEN:
     print("Missing MASTODON_INSTANCE_URL or MASTODON_ACCESS_TOKEN", file=sys.stderr)
@@ -23,6 +23,7 @@ SESSION.headers.update({
 
 
 def strip_html(html: str) -> str:
+    """Remove HTML tags and return plain text."""
     from html.parser import HTMLParser
 
     class Stripper(HTMLParser):
@@ -38,30 +39,32 @@ def strip_html(html: str) -> str:
     return "".join(s.parts)
 
 
-def extract_first_link_from_html(html: str) -> str | None:
+def extract_first_link(html: str) -> str | None:
+    """Extract the first <a href="..."> link from HTML, if any."""
     from html.parser import HTMLParser
 
-    class LinkFinder(HTMLParser):
+    class Finder(HTMLParser):
         def __init__(self):
             super().__init__()
-            self.first_href = None
+            self.href = None
 
         def handle_starttag(self, tag, attrs):
-            if self.first_href is not None:
+            if self.href is not None:
                 return
             if tag.lower() != "a":
                 return
             for k, v in attrs:
                 if k.lower() == "href":
-                    self.first_href = v
+                    self.href = v
                     break
 
-    lf = LinkFinder()
-    lf.feed(html or "")
-    return lf.first_href
+    f = Finder()
+    f.feed(html or "")
+    return f.href
 
 
 def escape_xml(text: str) -> str:
+    """Escape special XML characters."""
     return (
         text.replace("&", "&amp;")
         .replace("<", "&lt;")
@@ -71,16 +74,27 @@ def escape_xml(text: str) -> str:
     )
 
 
-def format_rfc822(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+def format_date(dt_str: str | None) -> str:
+    """Format an ISO date string as RFC 822 (for RSS pubDate)."""
+    if not dt_str:
+        return datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    try:
+        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        return dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    except Exception:
+        return datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
 
 
-def parse_link_header(link_header: str | None) -> dict:
-    """Parse Mastodon Link header for pagination."""
+def parse_link_header(header: str | None) -> dict:
+    """
+    Parse Mastodon's HTTP Link header for pagination links.
+    Example:
+      <https://.../api/v1/bookmarks?max_id=123>; rel="next"
+    """
+    if not header:
+        return {}
     links = {}
-    if not link_header:
-        return links
-    parts = link_header.split(",")
+    parts = header.split(",")
     for part in parts:
         section = part.strip().split(";")
         if len(section) < 2:
@@ -88,115 +102,106 @@ def parse_link_header(link_header: str | None) -> dict:
         url_part = section[0].strip()
         if not (url_part.startswith("<") and url_part.endswith(">")):
             continue
-        url = url_part[1:-1]
+        url = url_part[1:-1]  # remove <>
         rel = None
-        for attr in section[1:]:
-            attr = attr.strip()
-            if attr.startswith("rel="):
-                rel = attr.split("=", 1)[1].strip('"')
+        for a in section[1:]:
+            a = a.strip()
+            if a.startswith("rel="):
+                rel = a.split("=", 1)[1].strip('"')
         if rel:
             links[rel] = url
     return links
 
 
-def fetch_bookmarks(instance_url: str, max_items: int):
-    url = f"{instance_url}/api/v1/bookmarks?limit=40"
-    collected = []
+def fetch_bookmarks(instance: str, max_items: int):
+    """
+    Fetch up to max_items bookmarks from the Mastodon API, following pagination.
+    """
+    url = f"{instance}/api/v1/bookmarks?limit=40"
+    results: list[dict] = []
 
-    while url and len(collected) < max_items:
-        resp = SESSION.get(url, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
+    while url and len(results) < max_items:
+        r = SESSION.get(url, timeout=30)
+        r.raise_for_status()
+        data = r.json()
         if not isinstance(data, list) or not data:
             break
 
-        collected.extend(data)
-        if len(collected) >= max_items:
-            break
+        results.extend(data)
 
-        links = parse_link_header(resp.headers.get("Link"))
+        # Follow pagination via Link header
+        links = parse_link_header(r.headers.get("Link"))
         url = links.get("next")
 
-    return collected[:max_items]
+    return results[:max_items]
 
 
-def build_rss(instance_url: str, bookmarks: list[dict]) -> str:
+def build_rss(instance: str, statuses: list[dict]) -> str:
+    """
+    Build an RSS 2.0 feed from a list of Mastodon status objects.
+    """
     now = datetime.now(timezone.utc)
-    channel_title = f"Mastodon bookmarks ({instance_url})"
-    channel_link = instance_url
-    channel_desc = "RSS feed generated automatically from Mastodon bookmarks"
+    items = []
 
-    items_xml = []
-
-    for status in bookmarks:
-        content_html = status.get("content") or ""
+    for st in statuses:
+        content_html = st.get("content") or ""
         content_text = strip_html(content_html).strip()
-        status_url = status.get("url") or ""
-        external_link = extract_first_link_from_html(content_html)
-        link = external_link or status_url or instance_url
 
-        account = status.get("account") or {}
-        acct = account.get("acct") or "unknown"
+        link = extract_first_link(content_html) or st.get("url") or instance
+        account = st.get("account") or {}
+        handle = account.get("acct") or "unknown"
 
-        spoiler = (status.get("spoiler_text") or "").strip()
+        # Choose a title: use CW/spoiler if present, else first line, else fallback
+        spoiler = (st.get("spoiler_text") or "").strip()
         if spoiler:
             title = spoiler
         else:
-            first_line = content_text.splitlines()[0] if content_text else ""
-            title = first_line or f"Toot by @{acct}"
+            if content_text:
+                title = content_text.split("\n", 1)[0]
+            else:
+                title = f"Toot by @{handle}"
 
         if len(title) > 120:
             title = title[:117] + "..."
 
-        created_at = status.get("created_at")
-        bookmarked_at = status.get("bookmarked_at")
-        pub_dt = None
-        for candidate in (bookmarked_at, created_at):
-            if not candidate:
-                continue
-            try:
-                pub_dt = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
-                break
-            except Exception:
-                continue
-        if pub_dt is None:
-            pub_dt = now
+        description = content_text or f"Toot by @{handle}"
+        pub_date = format_date(st.get("bookmarked_at") or st.get("created_at"))
 
-        description = content_text or f"Toot by @{acct} at {status_url}"
-
-        item_xml = textwrap.dedent(
-            f"""\
+        item = textwrap.dedent(
+            f"""
             <item>
               <title>{escape_xml(title)}</title>
               <link>{escape_xml(link)}</link>
-              <guid isPermaLink="false">{escape_xml(status.get("id") or link)}</guid>
-              <pubDate>{format_rfc822(pub_dt)}</pubDate>
+              <guid isPermaLink="false">{escape_xml(st.get("id") or link)}</guid>
+              <pubDate>{pub_date}</pubDate>
               <description>{escape_xml(description)}</description>
-            </item>"""
-        )
-        items_xml.append(item_xml)
+            </item>
+            """
+        ).strip()
 
-    items_joined = "\n".join(items_xml)
+        items.append(item)
 
-    rss = textwrap.dedent(
-        f"""\
-        <?xml version="1.0" encoding="UTF-8"?>
-        <rss version="2.0">
-        <channel>
-          <title>{escape_xml(channel_title)}</title>
-          <link>{escape_xml(channel_link)}</link>
-          <description>{escape_xml(channel_desc)}</description>
-          <lastBuildDate>{format_rfc822(now)}</lastBuildDate>
-        {items_joined}
-        </channel>
-        </rss>
-        """
+    rss_items = "\n".join(items)
+
+    # IMPORTANT: XML declaration must be the FIRST characters in the file – no leading newline.
+    rss = (
+        f'<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<rss version="2.0">\n'
+        f'<channel>\n'
+        f'  <title>Mastodon Bookmarks RSS</title>\n'
+        f'  <link>{escape_xml(instance)}</link>\n'
+        f'  <description>RSS feed generated from Mastodon bookmarks</description>\n'
+        f'  <lastBuildDate>{now.strftime("%a, %d %b %Y %H:%M:%S GMT")}</lastBuildDate>\n'
+        f'{rss_items}\n'
+        f'</channel>\n'
+        f'</rss>\n'
     )
+
     return rss
 
 
 def main():
-    print(f"Fetching bookmarks from {INSTANCE_URL}", file=sys.stderr)
+    print(f"Fetching up to {MAX_BOOKMARKS} bookmarks from {INSTANCE_URL} ...", file=sys.stderr)
     bookmarks = fetch_bookmarks(INSTANCE_URL, MAX_BOOKMARKS)
     print(f"Fetched {len(bookmarks)} bookmarks", file=sys.stderr)
 
