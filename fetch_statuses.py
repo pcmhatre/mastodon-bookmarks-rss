@@ -6,10 +6,12 @@ from datetime import datetime, timezone, timedelta
 
 import requests
 
-# Read configuration from environment variables (set via GitHub Secrets)
+# Configuration from environment (set as GitHub Secrets)
 INSTANCE_URL = os.environ.get("MASTODON_INSTANCE_URL", "").rstrip("/")
 ACCESS_TOKEN = os.environ.get("MASTODON_ACCESS_TOKEN", "")
-MAX_STATUSES = int(os.environ.get("MAX_STATUSES", "80"))
+
+raw_max = os.environ.get("MAX_STATUSES", "").strip()
+MAX_STATUSES = int(raw_max) if raw_max.isdigit() else 80
 
 if not INSTANCE_URL or not ACCESS_TOKEN:
     print("Missing MASTODON_INSTANCE_URL or MASTODON_ACCESS_TOKEN", file=sys.stderr)
@@ -20,6 +22,9 @@ SESSION.headers.update({
     "Authorization": f"Bearer {ACCESS_TOKEN}",
     "Accept": "application/json",
 })
+
+# Public URL of your GitHub Pages site (for fallback links)
+PAGES_BASE_URL = "https://pcmhatre.github.io/mastodon-bookmarks-rss/"  # <-- change YOUR-USERNAME
 
 
 def strip_html(html: str) -> str:
@@ -69,19 +74,9 @@ def escape_xml(text: str) -> str:
         text.replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
+        .replace('"', "&quot;")
         .replace("'", "&apos;")
     )
-
-
-def format_date(dt_str: str | None) -> str:
-    """Format an ISO date string as RFC 822 (for RSS pubDate)."""
-    if not dt_str:
-        return datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
-    try:
-        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-        return dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
-    except Exception:
-        return datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
 
 
 def parse_link_header(header: str | None) -> dict:
@@ -193,7 +188,7 @@ def fetch_statuses(instance: str, max_items: int):
 def build_rss(instance: str, statuses: list[dict]) -> str:
     """
     Build an RSS 2.0 feed from a list of your Mastodon status objects.
-    Note: we intentionally omit the XML declaration.
+    Note: no XML declaration; IFTTT-friendly.
     """
     now = datetime.now(timezone.utc)
     items = []
@@ -202,11 +197,13 @@ def build_rss(instance: str, statuses: list[dict]) -> str:
         content_html = st.get("content") or ""
         content_text = strip_html(content_html).strip()
 
-        link = extract_first_link(content_html) or st.get("url") or instance
+        external_link = extract_first_link(content_html)
+        link = external_link or PAGES_BASE_URL
+
         account = st.get("account") or {}
         handle = account.get("acct") or "me"
 
-        # Choose a title: use CW/spoiler if present, else first line, else fallback
+        # Title: CW/spoiler if present, else first line, else fallback
         spoiler = (st.get("spoiler_text") or "").strip()
         if spoiler:
             title = spoiler
@@ -220,14 +217,20 @@ def build_rss(instance: str, statuses: list[dict]) -> str:
             title = title[:117] + "..."
 
         description = content_text or f"Post by @{handle}"
-        pub_date = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+        # pubDate = time of this run (good for IFTTT freshness)
+        pub_date = now.strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+        # Stable GUID per status
+        guid_val = f"status-{st.get('id')}"
+        guid = escape_xml(guid_val)
 
         item = textwrap.dedent(
             f"""
             <item>
               <title>{escape_xml(title)}</title>
               <link>{escape_xml(link)}</link>
-              <guid isPermaLink="false">{escape_xml(st.get("id") or link)}</guid>
+              <guid isPermaLink="false">{guid}</guid>
               <pubDate>{pub_date}</pubDate>
               <description>{escape_xml(description)}</description>
             </item>

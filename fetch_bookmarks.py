@@ -6,10 +6,12 @@ from datetime import datetime, timezone
 
 import requests
 
-# Read configuration from environment variables (set via GitHub Secrets)
+# Configuration from environment (set as GitHub Secrets)
 INSTANCE_URL = os.environ.get("MASTODON_INSTANCE_URL", "").rstrip("/")
 ACCESS_TOKEN = os.environ.get("MASTODON_ACCESS_TOKEN", "")
-MAX_BOOKMARKS = int(os.environ.get("MAX_BOOKMARKS", "80"))
+
+raw_max = os.environ.get("MAX_BOOKMARKS", "").strip()
+MAX_BOOKMARKS = int(raw_max) if raw_max.isdigit() else 80
 
 if not INSTANCE_URL or not ACCESS_TOKEN:
     print("Missing MASTODON_INSTANCE_URL or MASTODON_ACCESS_TOKEN", file=sys.stderr)
@@ -20,6 +22,9 @@ SESSION.headers.update({
     "Authorization": f"Bearer {ACCESS_TOKEN}",
     "Accept": "application/json",
 })
+
+# Public URL of your GitHub Pages site (for fallback links)
+PAGES_BASE_URL = "https://pcmhatre.github.io/mastodon-bookmarks-rss/"  # <-- change YOUR-USERNAME
 
 
 def strip_html(html: str) -> str:
@@ -74,23 +79,8 @@ def escape_xml(text: str) -> str:
     )
 
 
-def format_date(dt_str: str | None) -> str:
-    """Format an ISO date string as RFC 822 (for RSS pubDate)."""
-    if not dt_str:
-        return datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
-    try:
-        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-        return dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
-    except Exception:
-        return datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
-
-
 def parse_link_header(header: str | None) -> dict:
-    """
-    Parse Mastodon's HTTP Link header for pagination links.
-    Example:
-      <https://.../api/v1/bookmarks?max_id=123>; rel="next"
-    """
+    """Parse Mastodon's HTTP Link header for pagination links."""
     if not header:
         return {}
     links = {}
@@ -129,7 +119,9 @@ def fetch_bookmarks(instance: str, max_items: int):
 
         results.extend(data)
 
-        # Follow pagination via Link header
+        if len(results) >= max_items:
+            break
+
         links = parse_link_header(r.headers.get("Link"))
         url = links.get("next")
 
@@ -138,9 +130,8 @@ def fetch_bookmarks(instance: str, max_items: int):
 
 def build_rss(instance: str, statuses: list[dict]) -> str:
     """
-    Build an RSS 2.0 feed from a list of Mastodon status objects.
-    Note: we intentionally omit the XML declaration to avoid parser issues with
-    “XML declaration allowed only at the start of the document”.
+    Build an RSS 2.0 feed from a list of Mastodon bookmark status objects.
+    Note: no XML declaration; IFTTT-friendly.
     """
     now = datetime.now(timezone.utc)
     items = []
@@ -149,11 +140,15 @@ def build_rss(instance: str, statuses: list[dict]) -> str:
         content_html = st.get("content") or ""
         content_text = strip_html(content_html).strip()
 
-        link = extract_first_link(content_html) or st.get("url") or instance
+        external_link = extract_first_link(content_html)
+
+        # Prefer the external URL (the thing being bookmarked), otherwise fallback to your Pages index.
+        link = external_link or PAGES_BASE_URL
+
         account = st.get("account") or {}
         handle = account.get("acct") or "unknown"
 
-        # Choose a title: use CW/spoiler if present, else first line, else fallback
+        # Title: spoiler/CW if present, else first line, else fallback
         spoiler = (st.get("spoiler_text") or "").strip()
         if spoiler:
             title = spoiler
@@ -161,20 +156,26 @@ def build_rss(instance: str, statuses: list[dict]) -> str:
             if content_text:
                 title = content_text.split("\n", 1)[0]
             else:
-                title = f"Toot by @{handle}"
+                title = f"Bookmark from @{handle}"
 
         if len(title) > 120:
             title = title[:117] + "..."
 
-        description = content_text or f"Toot by @{handle}"
-        pub_date = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        description = content_text or f"Bookmark from @{handle}"
+
+        # pubDate = time of this run (good for IFTTT freshness)
+        pub_date = now.strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+        # Stable GUID per bookmark
+        guid_val = f"bookmark-{st.get('id')}"
+        guid = escape_xml(guid_val)
 
         item = textwrap.dedent(
             f"""
             <item>
               <title>{escape_xml(title)}</title>
               <link>{escape_xml(link)}</link>
-              <guid isPermaLink="false">{escape_xml(st.get("id") or link)}</guid>
+              <guid isPermaLink="false">{guid}</guid>
               <pubDate>{pub_date}</pubDate>
               <description>{escape_xml(description)}</description>
             </item>
@@ -185,13 +186,12 @@ def build_rss(instance: str, statuses: list[dict]) -> str:
 
     rss_items = "\n".join(items)
 
-    # Start directly with <rss>, no XML declaration
     rss = (
         f'<rss version="2.0">\n'
         f'<channel>\n'
         f'  <title>Mastodon Bookmarks RSS</title>\n'
         f'  <link>{escape_xml(instance)}</link>\n'
-        f'  <description>RSS feed generated from Mastodon bookmarks</description>\n'
+        f'  <description>RSS feed generated from my Mastodon bookmarks</description>\n'
         f'  <lastBuildDate>{now.strftime("%a, %d %b %Y %H:%M:%S GMT")}</lastBuildDate>\n'
         f'{rss_items}\n'
         f'</channel>\n'
@@ -202,7 +202,10 @@ def build_rss(instance: str, statuses: list[dict]) -> str:
 
 
 def main():
-    print(f"Fetching up to {MAX_BOOKMARKS} bookmarks from {INSTANCE_URL} ...", file=sys.stderr)
+    print(
+        f"Fetching up to {MAX_BOOKMARKS} bookmarks from {INSTANCE_URL} ...",
+        file=sys.stderr,
+    )
     bookmarks = fetch_bookmarks(INSTANCE_URL, MAX_BOOKMARKS)
     print(f"Fetched {len(bookmarks)} bookmarks", file=sys.stderr)
 
