@@ -126,10 +126,10 @@ def fetch_statuses(instance: str, max_items: int):
       - Excludes reblogs/boosts
       - Excludes replies
       - Excludes direct messages
-      - Only keeps posts from the last 2 days
+      - Only keeps posts from the last 24 hours
     """
     now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(days=2)
+    cutoff = now - timedelta(days=1)
 
     account_id = get_own_account_id(instance)
 
@@ -166,7 +166,7 @@ def fetch_statuses(instance: str, max_items: int):
             else:
                 created_at = now
 
-            # Stop once we hit posts older than 2 days
+            # Stop once we hit posts older than 24 hours
             if created_at < cutoff:
                 reached_cutoff = True
                 break
@@ -244,9 +244,9 @@ def build_rss(instance: str, statuses: list[dict]) -> str:
     rss = (
         f'<rss version="2.0">\n'
         f'<channel>\n'
-        f'  <title>Mastodon Posts RSS (last 2 days, no replies/boosts)</title>\n'
+        f'  <title>Mastodon Posts RSS (last 24h, no replies/boosts)</title>\n'
         f'  <link>{escape_xml(instance)}</link>\n'
-        f'  <description>RSS feed generated from my Mastodon posts (last 2 days, originals only)</description>\n'
+        f'  <description>RSS feed generated from my Mastodon posts (last 24 hours, originals only)</description>\n'
         f'  <lastBuildDate>{now.strftime("%a, %d %b %Y %H:%M:%S GMT")}</lastBuildDate>\n'
         f'{rss_items}\n'
         f'</channel>\n'
@@ -259,7 +259,7 @@ def build_rss(instance: str, statuses: list[dict]) -> str:
 def main():
     print(
         f"Fetching up to {MAX_STATUSES} statuses from {INSTANCE_URL} "
-        "(no replies, no boosts, last 2 days only) ...",
+        "(no replies, no boosts, last 24 hours only) ...",
         file=sys.stderr,
     )
     statuses = fetch_statuses(INSTANCE_URL, MAX_STATUSES)

@@ -1,4 +1,4 @@
-name: Generate Mastodon bookmarks RSS
+name: Generate Mastodon RSS feeds
 
 on:
   schedule:
@@ -32,7 +32,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Generate RSS
+      - name: Generate bookmarks RSS
         env:
           MASTODON_INSTANCE_URL: ${{ secrets.MASTODON_INSTANCE_URL }}
           MASTODON_ACCESS_TOKEN: ${{ secrets.MASTODON_ACCESS_TOKEN }}
@@ -40,11 +40,33 @@ jobs:
         run: |
           python fetch_bookmarks.py
 
+      - name: Generate statuses RSS
+        env:
+          MASTODON_INSTANCE_URL: ${{ secrets.MASTODON_INSTANCE_URL }}
+          MASTODON_ACCESS_TOKEN: ${{ secrets.MASTODON_ACCESS_TOKEN }}
+          MAX_STATUSES: ${{ secrets.MAX_STATUSES }}
+        run: |
+          python fetch_statuses.py
+
       - name: Prepare artifact
         run: |
           mkdir -p public
-          cp mastodon-bookmarks.xml public/
-          echo "<html><body><h1>Mastodon Bookmarks RSS</h1><p><a href='mastodon-bookmarks.xml'>RSS Feed</a></p></body></html>" > public/index.html
+          # Copy feeds if they exist
+          if [ -f mastodon-bookmarks.xml ]; then cp mastodon-bookmarks.xml public/; fi
+          if [ -f mastodon-statuses.xml ]; then cp mastodon-statuses.xml public/; fi
+          cat > public/index.html <<EOF
+          <!doctype html>
+          <html>
+          <head><meta charset="utf-8"><title>Mastodon RSS feeds</title></head>
+          <body>
+            <h1>Mastodon RSS feeds</h1>
+            <ul>
+              <li><a href="mastodon-bookmarks.xml">Bookmarks RSS (last 24h)</a></li>
+              <li><a href="mastodon-statuses.xml">Posts RSS (last 24h, no replies/boosts)</a></li>
+            </ul>
+          </body>
+          </html>
+          EOF
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

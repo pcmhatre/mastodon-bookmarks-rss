@@ -2,7 +2,7 @@
 import os
 import sys
 import textwrap
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 
@@ -72,7 +72,7 @@ def escape_xml(text: str) -> str:
     """Escape special XML characters."""
     return (
         text.replace("&", "&amp;")
-        .replace("<", "&lt;")
+        .replace("<", "&lt>")
         .replace(">", "&gt;")
         .replace('"', "&quot;")
         .replace("'", "&apos;")
@@ -131,12 +131,29 @@ def fetch_bookmarks(instance: str, max_items: int):
 def build_rss(instance: str, statuses: list[dict]) -> str:
     """
     Build an RSS 2.0 feed from a list of Mastodon bookmark status objects.
+    Only include items from the last 24 hours.
     Note: no XML declaration; IFTTT-friendly.
     """
     now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=1)
     items = []
 
     for st in statuses:
+        # Filter by created_at – skip items older than 24 hours
+        created_at_str = st.get("created_at")
+        if created_at_str:
+            try:
+                created_at = datetime.fromisoformat(
+                    created_at_str.replace("Z", "+00:00")
+                )
+            except Exception:
+                created_at = now
+        else:
+            created_at = now
+
+        if created_at < cutoff:
+            continue
+
         content_html = st.get("content") or ""
         content_text = strip_html(content_html).strip()
 
@@ -189,9 +206,9 @@ def build_rss(instance: str, statuses: list[dict]) -> str:
     rss = (
         f'<rss version="2.0">\n'
         f'<channel>\n'
-        f'  <title>Mastodon Bookmarks RSS</title>\n'
+        f'  <title>Mastodon Bookmarks RSS (last 24h)</title>\n'
         f'  <link>{escape_xml(instance)}</link>\n'
-        f'  <description>RSS feed generated from my Mastodon bookmarks</description>\n'
+        f'  <description>RSS feed generated from my Mastodon bookmarks (last 24 hours)</description>\n'
         f'  <lastBuildDate>{now.strftime("%a, %d %b %Y %H:%M:%S GMT")}</lastBuildDate>\n'
         f'{rss_items}\n'
         f'</channel>\n'
