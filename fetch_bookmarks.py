@@ -167,7 +167,7 @@ def build_rss(instance: str, statuses: list[dict]) -> str:
             title = title[:117] + "..."
 
         description = content_text or f"Toot by @{handle}"
-        pub_date = format_date(st.get("bookmarked_at") or st.get("created_at"))
+        pub_date = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
 
         item = textwrap.dedent(
             f"""
