@@ -3,10 +3,10 @@ import os
 import sys
 import textwrap
 from datetime import datetime, timezone, timedelta
+import html as pyhtml
 
 import requests
 
-# Configuration from environment (set as GitHub Secrets)
 INSTANCE_URL = os.environ.get("MASTODON_INSTANCE_URL", "").rstrip("/")
 ACCESS_TOKEN = os.environ.get("MASTODON_ACCESS_TOKEN", "")
 
@@ -23,12 +23,10 @@ SESSION.headers.update({
     "Accept": "application/json",
 })
 
-# Public URL of your GitHub Pages site (for fallback links)
 PAGES_BASE_URL = "https://pcmhatre.github.io/mastodon-bookmarks-rss/"  # <-- change YOUR-USERNAME
 
 
 def strip_html(html: str) -> str:
-    """Remove HTML tags and return plain text."""
     from html.parser import HTMLParser
 
     class Stripper(HTMLParser):
@@ -45,7 +43,6 @@ def strip_html(html: str) -> str:
 
 
 def extract_first_link(html: str) -> str | None:
-    """Extract the first <a href="..."> link from HTML, if any."""
     from html.parser import HTMLParser
 
     class Finder(HTMLParser):
@@ -69,7 +66,6 @@ def extract_first_link(html: str) -> str | None:
 
 
 def escape_xml(text: str) -> str:
-    """Escape special XML characters."""
     return (
         text.replace("&", "&amp;")
         .replace("<", "&lt;")
@@ -79,8 +75,11 @@ def escape_xml(text: str) -> str:
     )
 
 
+def cdata(text: str) -> str:
+    return "<![CDATA[" + text.replace("]]>", "]]]]><![CDATA[>") + "]]>"
+
+
 def parse_link_header(header: str | None) -> dict:
-    """Parse Mastodon's HTTP Link header for pagination links."""
     if not header:
         return {}
     links = {}
@@ -104,7 +103,6 @@ def parse_link_header(header: str | None) -> dict:
 
 
 def get_own_account_id(instance: str) -> str:
-    """Use /api/v1/accounts/verify_credentials to get your own account ID."""
     url = f"{instance}/api/v1/accounts/verify_credentials"
     r = SESSION.get(url, timeout=30)
     r.raise_for_status()
@@ -117,15 +115,9 @@ def get_own_account_id(instance: str) -> str:
 
 
 def fetch_statuses(instance: str, max_items: int):
-    """
-    Fetch up to max_items of YOUR OWN STATUSES:
-      - Excludes boosts
-      - Excludes replies
-      - Excludes DMs
-      - Only keeps posts from the last 24 hours
-    """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=1)
+
     account_id = get_own_account_id(instance)
 
     url = (
@@ -184,8 +176,19 @@ def _mime_for_attachment(att: dict) -> str:
     return "application/octet-stream"
 
 
-def media_blocks(st: dict, limit: int = 4) -> str:
-    """Return optional RSS media fields using up to `limit` media attachments."""
+def extract_media_urls(st: dict, limit: int = 4) -> list[str]:
+    urls: list[str] = []
+    media_attachments = st.get("media_attachments") or []
+    for att in media_attachments[:limit]:
+        if not isinstance(att, dict):
+            continue
+        u = att.get("url") or att.get("preview_url")
+        if u:
+            urls.append(u)
+    return urls
+
+
+def media_rss_blocks(st: dict, limit: int = 4) -> str:
     media_attachments = st.get("media_attachments") or []
     if not media_attachments:
         return ""
@@ -202,14 +205,30 @@ def media_blocks(st: dict, limit: int = 4) -> str:
         lines.append(f'      <enclosure url="{esc_url}" length="0" type="{mime}" />')
         lines.append(f'      <media:content url="{esc_url}" />')
 
-    if not lines:
-        return ""
+    return ("\n" + "\n".join(lines)) if lines else ""
 
-    return "\n" + "\n".join(lines)
+
+def build_description_html(text: str, media_urls: list[str]) -> str:
+    safe_text = pyhtml.escape(text or "")
+    parts: list[str] = []
+    if safe_text:
+        parts.append(f"<p>{safe_text}</p>")
+
+    if media_urls:
+        first = pyhtml.escape(media_urls[0], quote=True)
+        parts.append(f'<p><img src="{first}" alt="image" /></p>')
+
+        if len(media_urls) > 1:
+            parts.append("<p>More images:</p><ul>")
+            for u in media_urls[1:4]:
+                esc = pyhtml.escape(u, quote=True)
+                parts.append(f'<li><a href="{esc}">{esc}</a></li>')
+            parts.append("</ul>")
+
+    return "\n".join(parts) if parts else "<p></p>"
 
 
 def build_rss(instance: str, statuses: list[dict]) -> str:
-    """Build an RSS 2.0 feed from your Mastodon statuses."""
     now = datetime.now(timezone.utc)
     items: list[str] = []
 
@@ -228,15 +247,15 @@ def build_rss(instance: str, statuses: list[dict]) -> str:
             title = spoiler
         else:
             title = content_text.split("\n", 1)[0] if content_text else f"Post by @{handle}"
-
         if len(title) > 120:
             title = title[:117] + "..."
 
-        description = content_text or f"Post by @{handle}"
         pub_date = now.strftime("%a, %d %b %Y %H:%M:%S GMT")
         guid = escape_xml(f"status-{st.get('id')}")
 
-        media_block = media_blocks(st, limit=4)
+        media_urls = extract_media_urls(st, limit=4)
+        media_block = media_rss_blocks(st, limit=4)
+        desc_html = build_description_html(content_text or f"Post by @{handle}", media_urls)
 
         item = textwrap.dedent(
             f"""
@@ -245,7 +264,7 @@ def build_rss(instance: str, statuses: list[dict]) -> str:
               <link>{escape_xml(link)}</link>{media_block}
               <guid isPermaLink="false">{guid}</guid>
               <pubDate>{pub_date}</pubDate>
-              <description>{escape_xml(description)}</description>
+              <description>{cdata(desc_html)}</description>
             </item>
             """
         ).strip()

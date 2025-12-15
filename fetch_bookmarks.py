@@ -3,10 +3,10 @@ import os
 import sys
 import textwrap
 from datetime import datetime, timezone, timedelta
+import html as pyhtml
 
 import requests
 
-# Configuration from environment (set as GitHub Secrets)
 INSTANCE_URL = os.environ.get("MASTODON_INSTANCE_URL", "").rstrip("/")
 ACCESS_TOKEN = os.environ.get("MASTODON_ACCESS_TOKEN", "")
 
@@ -23,12 +23,10 @@ SESSION.headers.update({
     "Accept": "application/json",
 })
 
-# Public URL of your GitHub Pages site (for fallback links)
 PAGES_BASE_URL = "https://pcmhatre.github.io/mastodon-bookmarks-rss/"  # <-- change YOUR-USERNAME
 
 
 def strip_html(html: str) -> str:
-    """Remove HTML tags and return plain text."""
     from html.parser import HTMLParser
 
     class Stripper(HTMLParser):
@@ -45,7 +43,6 @@ def strip_html(html: str) -> str:
 
 
 def extract_first_link(html: str) -> str | None:
-    """Extract the first <a href="..."> link from HTML, if any."""
     from html.parser import HTMLParser
 
     class Finder(HTMLParser):
@@ -69,7 +66,6 @@ def extract_first_link(html: str) -> str | None:
 
 
 def escape_xml(text: str) -> str:
-    """Escape special XML characters."""
     return (
         text.replace("&", "&amp;")
         .replace("<", "&lt;")
@@ -79,8 +75,12 @@ def escape_xml(text: str) -> str:
     )
 
 
+def cdata(text: str) -> str:
+    # Prevent breaking CDATA if content contains "]]>"
+    return "<![CDATA[" + text.replace("]]>", "]]]]><![CDATA[>") + "]]>"
+
+
 def parse_link_header(header: str | None) -> dict:
-    """Parse Mastodon's HTTP Link header for pagination links."""
     if not header:
         return {}
     links = {}
@@ -104,7 +104,6 @@ def parse_link_header(header: str | None) -> dict:
 
 
 def fetch_bookmarks(instance: str, max_items: int):
-    """Fetch up to max_items bookmarks from the Mastodon API, following pagination."""
     url = f"{instance}/api/v1/bookmarks?limit=40"
     results: list[dict] = []
 
@@ -127,8 +126,7 @@ def fetch_bookmarks(instance: str, max_items: int):
 
 
 def _mime_for_attachment(att: dict) -> str:
-    """Best-effort MIME types for enclosure tags."""
-    mtype = (att.get("type") or "").lower()  # image, video, gifv, audio
+    mtype = (att.get("type") or "").lower()
     if mtype == "image":
         return "image/jpeg"
     if mtype in ("gifv", "video"):
@@ -138,12 +136,19 @@ def _mime_for_attachment(att: dict) -> str:
     return "application/octet-stream"
 
 
-def media_blocks(st: dict, limit: int = 4) -> str:
-    """
-    Return optional RSS media fields using up to `limit` media attachments:
-      - multiple <enclosure .../>
-      - multiple <media:content .../>
-    """
+def extract_media_urls(st: dict, limit: int = 4) -> list[str]:
+    urls: list[str] = []
+    media_attachments = st.get("media_attachments") or []
+    for att in media_attachments[:limit]:
+        if not isinstance(att, dict):
+            continue
+        u = att.get("url") or att.get("preview_url")
+        if u:
+            urls.append(u)
+    return urls
+
+
+def media_rss_blocks(st: dict, limit: int = 4) -> str:
     media_attachments = st.get("media_attachments") or []
     if not media_attachments:
         return ""
@@ -157,27 +162,41 @@ def media_blocks(st: dict, limit: int = 4) -> str:
             continue
         esc_url = escape_xml(media_url)
         mime = _mime_for_attachment(att)
-        # Some readers only use the first enclosure, but we output up to 4 anyway.
         lines.append(f'      <enclosure url="{esc_url}" length="0" type="{mime}" />')
         lines.append(f'      <media:content url="{esc_url}" />')
 
-    if not lines:
-        return ""
+    return ("\n" + "\n".join(lines)) if lines else ""
 
-    return "\n" + "\n".join(lines)
+
+def build_description_html(text: str, media_urls: list[str]) -> str:
+    # Plain text → simple HTML (escaped)
+    safe_text = pyhtml.escape(text or "")
+    parts: list[str] = []
+    if safe_text:
+        parts.append(f"<p>{safe_text}</p>")
+
+    # First image as <img> to help IFTTT populate EntryImageUrl
+    if media_urls:
+        first = pyhtml.escape(media_urls[0], quote=True)
+        parts.append(f'<p><img src="{first}" alt="image" /></p>')
+
+        # Remaining images as links
+        if len(media_urls) > 1:
+            parts.append("<p>More images:</p><ul>")
+            for u in media_urls[1:4]:
+                esc = pyhtml.escape(u, quote=True)
+                parts.append(f'<li><a href="{esc}">{esc}</a></li>')
+            parts.append("</ul>")
+
+    return "\n".join(parts) if parts else "<p></p>"
 
 
 def build_rss(instance: str, statuses: list[dict]) -> str:
-    """
-    Build an RSS 2.0 feed from Mastodon bookmark status objects.
-    Only include items from the last 24 hours.
-    """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=1)
     items: list[str] = []
 
     for st in statuses:
-        # Filter by created_at – skip items older than 24 hours
         created_at_str = st.get("created_at")
         if created_at_str:
             try:
@@ -204,15 +223,15 @@ def build_rss(instance: str, statuses: list[dict]) -> str:
             title = spoiler
         else:
             title = content_text.split("\n", 1)[0] if content_text else f"Bookmark from @{handle}"
-
         if len(title) > 120:
             title = title[:117] + "..."
 
-        description = content_text or f"Bookmark from @{handle}"
         pub_date = now.strftime("%a, %d %b %Y %H:%M:%S GMT")
         guid = escape_xml(f"bookmark-{st.get('id')}")
 
-        media_block = media_blocks(st, limit=4)
+        media_urls = extract_media_urls(st, limit=4)
+        media_block = media_rss_blocks(st, limit=4)
+        desc_html = build_description_html(content_text or f"Bookmark from @{handle}", media_urls)
 
         item = textwrap.dedent(
             f"""
@@ -221,7 +240,7 @@ def build_rss(instance: str, statuses: list[dict]) -> str:
               <link>{escape_xml(link)}</link>{media_block}
               <guid isPermaLink="false">{guid}</guid>
               <pubDate>{pub_date}</pubDate>
-              <description>{escape_xml(description)}</description>
+              <description>{cdata(desc_html)}</description>
             </item>
             """
         ).strip()
