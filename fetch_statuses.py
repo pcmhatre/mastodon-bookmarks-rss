@@ -80,11 +80,7 @@ def escape_xml(text: str) -> str:
 
 
 def parse_link_header(header: str | None) -> dict:
-    """
-    Parse Mastodon's HTTP Link header for pagination links.
-    Example:
-      <https://.../api/v1/accounts/ID/statuses?max_id=123>; rel="next"
-    """
+    """Parse Mastodon's HTTP Link header for pagination links."""
     if not header:
         return {}
     links = {}
@@ -96,7 +92,7 @@ def parse_link_header(header: str | None) -> dict:
         url_part = section[0].strip()
         if not (url_part.startswith("<") and url_part.endswith(">")):
             continue
-        url = url_part[1:-1]  # remove <>
+        url = url_part[1:-1]
         rel = None
         for a in section[1:]:
             a = a.strip()
@@ -123,18 +119,15 @@ def get_own_account_id(instance: str) -> str:
 def fetch_statuses(instance: str, max_items: int):
     """
     Fetch up to max_items of YOUR OWN STATUSES:
-      - Excludes reblogs/boosts
+      - Excludes boosts
       - Excludes replies
-      - Excludes direct messages
+      - Excludes DMs
       - Only keeps posts from the last 24 hours
     """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=1)
-
     account_id = get_own_account_id(instance)
 
-    # exclude_reblogs=true → drops boosts
-    # exclude_replies=true → drops replies
     url = (
         f"{instance}/api/v1/accounts/{account_id}/statuses"
         f"?limit=40&exclude_reblogs=true&exclude_replies=true"
@@ -151,22 +144,18 @@ def fetch_statuses(instance: str, max_items: int):
             break
 
         for st in data:
-            # Skip direct messages (DMs)
             if st.get("visibility") == "direct":
                 continue
 
             created_at_str = st.get("created_at")
             if created_at_str:
                 try:
-                    created_at = datetime.fromisoformat(
-                        created_at_str.replace("Z", "+00:00")
-                    )
+                    created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
                 except Exception:
                     created_at = now
             else:
                 created_at = now
 
-            # Stop once we hit posts older than 24 hours
             if created_at < cutoff:
                 reached_cutoff = True
                 break
@@ -178,20 +167,51 @@ def fetch_statuses(instance: str, max_items: int):
         if len(results) >= max_items or reached_cutoff:
             break
 
-        # Follow pagination via Link header
         links = parse_link_header(r.headers.get("Link"))
         url = links.get("next")
 
     return results[:max_items]
 
 
+def _mime_for_attachment(att: dict) -> str:
+    mtype = (att.get("type") or "").lower()
+    if mtype == "image":
+        return "image/jpeg"
+    if mtype in ("gifv", "video"):
+        return "video/mp4"
+    if mtype == "audio":
+        return "audio/mpeg"
+    return "application/octet-stream"
+
+
+def media_blocks(st: dict, limit: int = 4) -> str:
+    """Return optional RSS media fields using up to `limit` media attachments."""
+    media_attachments = st.get("media_attachments") or []
+    if not media_attachments:
+        return ""
+
+    lines: list[str] = []
+    for att in media_attachments[:limit]:
+        if not isinstance(att, dict):
+            continue
+        media_url = att.get("url") or att.get("preview_url")
+        if not media_url:
+            continue
+        esc_url = escape_xml(media_url)
+        mime = _mime_for_attachment(att)
+        lines.append(f'      <enclosure url="{esc_url}" length="0" type="{mime}" />')
+        lines.append(f'      <media:content url="{esc_url}" />')
+
+    if not lines:
+        return ""
+
+    return "\n" + "\n".join(lines)
+
+
 def build_rss(instance: str, statuses: list[dict]) -> str:
-    """
-    Build an RSS 2.0 feed from a list of your Mastodon status objects.
-    Note: no XML declaration; IFTTT-friendly.
-    """
+    """Build an RSS 2.0 feed from your Mastodon statuses."""
     now = datetime.now(timezone.utc)
-    items = []
+    items: list[str] = []
 
     for st in statuses:
         content_html = st.get("content") or ""
@@ -203,33 +223,26 @@ def build_rss(instance: str, statuses: list[dict]) -> str:
         account = st.get("account") or {}
         handle = account.get("acct") or "me"
 
-        # Title: CW/spoiler if present, else first line, else fallback
         spoiler = (st.get("spoiler_text") or "").strip()
         if spoiler:
             title = spoiler
         else:
-            if content_text:
-                title = content_text.split("\n", 1)[0]
-            else:
-                title = f"Post by @{handle}"
+            title = content_text.split("\n", 1)[0] if content_text else f"Post by @{handle}"
 
         if len(title) > 120:
             title = title[:117] + "..."
 
         description = content_text or f"Post by @{handle}"
-
-        # pubDate = time of this run (good for IFTTT freshness)
         pub_date = now.strftime("%a, %d %b %Y %H:%M:%S GMT")
+        guid = escape_xml(f"status-{st.get('id')}")
 
-        # Stable GUID per status
-        guid_val = f"status-{st.get('id')}"
-        guid = escape_xml(guid_val)
+        media_block = media_blocks(st, limit=4)
 
         item = textwrap.dedent(
             f"""
             <item>
               <title>{escape_xml(title)}</title>
-              <link>{escape_xml(link)}</link>
+              <link>{escape_xml(link)}</link>{media_block}
               <guid isPermaLink="false">{guid}</guid>
               <pubDate>{pub_date}</pubDate>
               <description>{escape_xml(description)}</description>
@@ -242,7 +255,7 @@ def build_rss(instance: str, statuses: list[dict]) -> str:
     rss_items = "\n".join(items)
 
     rss = (
-        f'<rss version="2.0">\n'
+        f'<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/">\n'
         f'<channel>\n'
         f'  <title>Mastodon Posts RSS (last 24h, no replies/boosts)</title>\n'
         f'  <link>{escape_xml(instance)}</link>\n'
@@ -252,7 +265,6 @@ def build_rss(instance: str, statuses: list[dict]) -> str:
         f'</channel>\n'
         f'</rss>\n'
     )
-
     return rss
 
 
@@ -266,11 +278,10 @@ def main():
     print(f"Fetched {len(statuses)} statuses after filtering", file=sys.stderr)
 
     rss = build_rss(INSTANCE_URL, statuses)
-    output_path = "mastodon-statuses.xml"
-    with open(output_path, "w", encoding="utf-8") as f:
+    with open("mastodon-statuses.xml", "w", encoding="utf-8") as f:
         f.write(rss)
 
-    print(f"Wrote RSS to {output_path}", file=sys.stderr)
+    print("Wrote RSS to mastodon-statuses.xml", file=sys.stderr)
 
 
 if __name__ == "__main__":

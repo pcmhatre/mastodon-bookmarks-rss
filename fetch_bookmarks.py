@@ -72,7 +72,7 @@ def escape_xml(text: str) -> str:
     """Escape special XML characters."""
     return (
         text.replace("&", "&amp;")
-        .replace("<", "&lt>")
+        .replace("<", "&lt;")
         .replace(">", "&gt;")
         .replace('"', "&quot;")
         .replace("'", "&apos;")
@@ -92,7 +92,7 @@ def parse_link_header(header: str | None) -> dict:
         url_part = section[0].strip()
         if not (url_part.startswith("<") and url_part.endswith(">")):
             continue
-        url = url_part[1:-1]  # remove <>
+        url = url_part[1:-1]
         rel = None
         for a in section[1:]:
             a = a.strip()
@@ -104,9 +104,7 @@ def parse_link_header(header: str | None) -> dict:
 
 
 def fetch_bookmarks(instance: str, max_items: int):
-    """
-    Fetch up to max_items bookmarks from the Mastodon API, following pagination.
-    """
+    """Fetch up to max_items bookmarks from the Mastodon API, following pagination."""
     url = f"{instance}/api/v1/bookmarks?limit=40"
     results: list[dict] = []
 
@@ -128,24 +126,62 @@ def fetch_bookmarks(instance: str, max_items: int):
     return results[:max_items]
 
 
+def _mime_for_attachment(att: dict) -> str:
+    """Best-effort MIME types for enclosure tags."""
+    mtype = (att.get("type") or "").lower()  # image, video, gifv, audio
+    if mtype == "image":
+        return "image/jpeg"
+    if mtype in ("gifv", "video"):
+        return "video/mp4"
+    if mtype == "audio":
+        return "audio/mpeg"
+    return "application/octet-stream"
+
+
+def media_blocks(st: dict, limit: int = 4) -> str:
+    """
+    Return optional RSS media fields using up to `limit` media attachments:
+      - multiple <enclosure .../>
+      - multiple <media:content .../>
+    """
+    media_attachments = st.get("media_attachments") or []
+    if not media_attachments:
+        return ""
+
+    lines: list[str] = []
+    for att in media_attachments[:limit]:
+        if not isinstance(att, dict):
+            continue
+        media_url = att.get("url") or att.get("preview_url")
+        if not media_url:
+            continue
+        esc_url = escape_xml(media_url)
+        mime = _mime_for_attachment(att)
+        # Some readers only use the first enclosure, but we output up to 4 anyway.
+        lines.append(f'      <enclosure url="{esc_url}" length="0" type="{mime}" />')
+        lines.append(f'      <media:content url="{esc_url}" />')
+
+    if not lines:
+        return ""
+
+    return "\n" + "\n".join(lines)
+
+
 def build_rss(instance: str, statuses: list[dict]) -> str:
     """
-    Build an RSS 2.0 feed from a list of Mastodon bookmark status objects.
+    Build an RSS 2.0 feed from Mastodon bookmark status objects.
     Only include items from the last 24 hours.
-    Note: no XML declaration; IFTTT-friendly.
     """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=1)
-    items = []
+    items: list[str] = []
 
     for st in statuses:
         # Filter by created_at – skip items older than 24 hours
         created_at_str = st.get("created_at")
         if created_at_str:
             try:
-                created_at = datetime.fromisoformat(
-                    created_at_str.replace("Z", "+00:00")
-                )
+                created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
             except Exception:
                 created_at = now
         else:
@@ -158,40 +194,31 @@ def build_rss(instance: str, statuses: list[dict]) -> str:
         content_text = strip_html(content_html).strip()
 
         external_link = extract_first_link(content_html)
-
-        # Prefer the external URL (the thing being bookmarked), otherwise fallback to your Pages index.
         link = external_link or PAGES_BASE_URL
 
         account = st.get("account") or {}
         handle = account.get("acct") or "unknown"
 
-        # Title: spoiler/CW if present, else first line, else fallback
         spoiler = (st.get("spoiler_text") or "").strip()
         if spoiler:
             title = spoiler
         else:
-            if content_text:
-                title = content_text.split("\n", 1)[0]
-            else:
-                title = f"Bookmark from @{handle}"
+            title = content_text.split("\n", 1)[0] if content_text else f"Bookmark from @{handle}"
 
         if len(title) > 120:
             title = title[:117] + "..."
 
         description = content_text or f"Bookmark from @{handle}"
-
-        # pubDate = time of this run (good for IFTTT freshness)
         pub_date = now.strftime("%a, %d %b %Y %H:%M:%S GMT")
+        guid = escape_xml(f"bookmark-{st.get('id')}")
 
-        # Stable GUID per bookmark
-        guid_val = f"bookmark-{st.get('id')}"
-        guid = escape_xml(guid_val)
+        media_block = media_blocks(st, limit=4)
 
         item = textwrap.dedent(
             f"""
             <item>
               <title>{escape_xml(title)}</title>
-              <link>{escape_xml(link)}</link>
+              <link>{escape_xml(link)}</link>{media_block}
               <guid isPermaLink="false">{guid}</guid>
               <pubDate>{pub_date}</pubDate>
               <description>{escape_xml(description)}</description>
@@ -204,7 +231,7 @@ def build_rss(instance: str, statuses: list[dict]) -> str:
     rss_items = "\n".join(items)
 
     rss = (
-        f'<rss version="2.0">\n'
+        f'<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/">\n'
         f'<channel>\n'
         f'  <title>Mastodon Bookmarks RSS (last 24h)</title>\n'
         f'  <link>{escape_xml(instance)}</link>\n'
@@ -214,24 +241,19 @@ def build_rss(instance: str, statuses: list[dict]) -> str:
         f'</channel>\n'
         f'</rss>\n'
     )
-
     return rss
 
 
 def main():
-    print(
-        f"Fetching up to {MAX_BOOKMARKS} bookmarks from {INSTANCE_URL} ...",
-        file=sys.stderr,
-    )
+    print(f"Fetching up to {MAX_BOOKMARKS} bookmarks from {INSTANCE_URL} ...", file=sys.stderr)
     bookmarks = fetch_bookmarks(INSTANCE_URL, MAX_BOOKMARKS)
     print(f"Fetched {len(bookmarks)} bookmarks", file=sys.stderr)
 
     rss = build_rss(INSTANCE_URL, bookmarks)
-    output_path = "mastodon-bookmarks.xml"
-    with open(output_path, "w", encoding="utf-8") as f:
+    with open("mastodon-bookmarks.xml", "w", encoding="utf-8") as f:
         f.write(rss)
 
-    print(f"Wrote RSS to {output_path}", file=sys.stderr)
+    print("Wrote RSS to mastodon-bookmarks.xml", file=sys.stderr)
 
 
 if __name__ == "__main__":
