@@ -21,6 +21,7 @@ SESSION = requests.Session()
 SESSION.headers.update({
     "Authorization": f"Bearer {ACCESS_TOKEN}",
     "Accept": "application/json",
+    "User-Agent": "mastodon-bookmarks-rss/1.0 (https://github.com/pcmhatre/mastodon-bookmarks-rss)",
 })
 
 PAGES_BASE_URL = "https://pcmhatre.github.io/mastodon-bookmarks-rss/"  # <-- change YOUR-USERNAME
